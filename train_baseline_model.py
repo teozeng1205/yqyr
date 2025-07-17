@@ -244,9 +244,14 @@ def train_baseline_model(target_name: str = 'both'):
     if target_name in ['yq', 'both']:
         print("\n4. TRAINING YQ MODEL")
         print("Splitting data...")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_selected, yq_classes, test_size=0.2, random_state=42, stratify=yq_classes
-        )
+        # Use tqdm for progress bar during data splitting
+        with tqdm(total=1, desc="Splitting YQ data", leave=False) as pbar:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_selected, yq_classes, test_size=0.2, random_state=42, stratify=yq_classes
+            )
+            pbar.update(1)
+        
+        print(f"YQ data split into X_train: {X_train.shape}, X_test: {X_test.shape}")
         
         print("Training Random Forest for YQ...")
         rf_yq = RandomForestClassifier(
@@ -277,9 +282,13 @@ def train_baseline_model(target_name: str = 'both'):
     if target_name in ['yr', 'both']:
         print("\n5. TRAINING YR MODEL")
         print("Splitting data...")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_selected, yr_classes, test_size=0.2, random_state=42, stratify=yr_classes
-        )
+        # Use tqdm for progress bar during data splitting
+        with tqdm(total=1, desc="Splitting YR data", leave=False) as pbar:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_selected, yr_classes, test_size=0.2, random_state=42, stratify=yr_classes
+            )
+            pbar.update(1)
+        print(f"YR data split into X_train: {X_train.shape}, X_test: {X_test.shape}")
         
         print("Training Random Forest for YR...")
         rf_yr = RandomForestClassifier(
