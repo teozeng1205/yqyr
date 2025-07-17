@@ -1,0 +1,8 @@
+YR Tax Prediction Model Results
+========================================
+
+RMSE: 6.10
+MAE: 1.19
+R²: 0.9953
+Hit Rate (±$2): 94.6%
+Features: 11

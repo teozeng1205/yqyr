@@ -1,0 +1,12 @@
+feature
+totalAmount
+advancePurchase
+lengthOfStay
+inboundDuration
+outboundDuration
+total_duration
+validatingCarrier_encoded
+inboundOperatingCarrier_encoded
+outboundOperatingCarrier_encoded
+price_tier
+early_booking
