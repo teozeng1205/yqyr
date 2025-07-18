@@ -9,7 +9,7 @@ Retains essential printing and progress bars.
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import LabelEncoder
 import glob
@@ -17,9 +17,59 @@ import os
 from tqdm import tqdm
 import gc
 import warnings
+import pickle
+from datetime import datetime
 # tqdm for progress bars (already imported), optuna will be imported lazily within the tuning function
 
 warnings.filterwarnings('ignore')
+
+# ---------------------------------------------------------------------------
+# Domain feature helper functions
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Calculate the great circle distance between two points on earth (in kilometers).
+    """
+    # Convert decimal degrees to radians
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    
+    # Radius of earth in kilometers
+    r = 6371
+    return c * r
+
+def load_city_locations():
+    """Load city location data for distance calculations."""
+    try:
+        city_locations = pd.read_csv('citylocation.csv', sep='\t')
+        print(f"✅ Loaded {len(city_locations)} city locations")
+        return city_locations.set_index('citycode')
+    except Exception as e:
+        print(f"⚠️ Could not load citylocation.csv: {e}")
+        return None
+
+def get_yq_banned_airports():
+    """Return set of airport codes where YQ taxes are typically banned/restricted."""
+    # Common airports/countries where YQ taxes are banned or restricted
+    banned_codes = {
+        # Brazil airports (BR country code in data)
+        'GRU', 'CGH', 'BSB', 'RIO', 'SDU', 'GIG', 'SSA', 'FOR', 'REC', 'MAO',
+        'BEL', 'CWB', 'FLN', 'POA', 'VIX', 'MCZ', 'NAT', 'AJU', 'JPA', 'THE',
+        # Hong Kong 
+        'HKG',
+        # Philippines airports (PH country code)
+        'MNL', 'CEB', 'DVO', 'ILO', 'CRK', 'KLO', 'TAG', 'BCD', 'CGY', 'DGT',
+        # Additional commonly restricted airports
+        'TPE', 'KHH',  # Taiwan
+        'ICN', 'GMP',  # South Korea
+        'NRT', 'HND',  # Japan (some restrictions)
+    }
+    return banned_codes
 
 # ---------------------------------------------------------------------------
 # Helper metric: percentage-based hit rate
@@ -70,9 +120,21 @@ def load_and_combine_data():
     print(f"✅ Combined dataset: {combined_df.shape}")
     return combined_df
 
-def preprocess_data(df):
+def preprocess_data(df, use_cache=True):
     """Preprocess and engineer features."""
     print("\n🔄 Step 2: Preprocessing and feature engineering...")
+    
+    # Check for cached preprocessed data
+    cache_file = 'preprocessed_data.pkl'
+    if use_cache and os.path.exists(cache_file):
+        print("📁 Loading cached preprocessed data...")
+        try:
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+                print("✅ Loaded cached preprocessed data")
+                return cached_data
+        except Exception as e:
+            print(f"⚠️ Error loading cache: {e}. Proceeding with fresh preprocessing...")
     
     df['yq'] = df['tax_yq_amount'].fillna(0)
     df['yr'] = df['tax_yr_amount'].fillna(0)
@@ -80,17 +142,99 @@ def preprocess_data(df):
     print(f"YQ stats: mean=${df['yq'].mean():.2f}, non-zero={df['yq'].gt(0).mean()*100:.1f}%")
     print(f"YR stats: mean=${df['yr'].mean():.2f}, non-zero={df['yr'].gt(0).mean()*100:.1f}%")
     
+    # Remove leakage: create base fare proxy instead of using raw totalAmount
+    print("Creating base fare proxy to remove leakage...")
+    est_other_taxes = 50  # Estimate for other taxes/fees not captured in yq/yr
+    df['base_fare'] = df['totalAmount'] - df['yq'] - df['yr'] - est_other_taxes
+    df['base_fare'] = df['base_fare'].clip(lower=0)  # Ensure non-negative
+    
     df['timestamp_dt'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['hour'] = df['timestamp_dt'].dt.hour
     df['day_of_week'] = df['timestamp_dt'].dt.dayofweek
     df['month'] = df['timestamp_dt'].dt.month
     
+    # Domain Feature 1: Great-circle distance between origin & destination
+    print("Adding great-circle distance feature...")
+    city_locations = load_city_locations()
+    if city_locations is not None:
+        # Merge origin coordinates
+        df = df.merge(
+            city_locations[['latitude', 'longitude']].rename(columns={
+                'latitude': 'origin_lat', 'longitude': 'origin_lon'
+            }),
+            left_on='originCityCode', right_index=True, how='left'
+        )
+        # Merge destination coordinates
+        df = df.merge(
+            city_locations[['latitude', 'longitude']].rename(columns={
+                'latitude': 'dest_lat', 'longitude': 'dest_lon'
+            }),
+            left_on='destinationCityCode', right_index=True, how='left'
+        )
+        
+        # Calculate distance for valid coordinates
+        valid_coords = df[['origin_lat', 'origin_lon', 'dest_lat', 'dest_lon']].notna().all(axis=1)
+        df['distance_km'] = 0.0
+        if valid_coords.sum() > 0:
+            df.loc[valid_coords, 'distance_km'] = haversine_distance(
+                df.loc[valid_coords, 'origin_lat'],
+                df.loc[valid_coords, 'origin_lon'],
+                df.loc[valid_coords, 'dest_lat'],
+                df.loc[valid_coords, 'dest_lon']
+            )
+        
+        print(f"✅ Added distance for {valid_coords.sum()}/{len(df)} routes")
+        # Clean up temporary columns
+        df.drop(['origin_lat', 'origin_lon', 'dest_lat', 'dest_lon'], axis=1, inplace=True)
+    else:
+        df['distance_km'] = 0.0
+        print("⚠️ Distance feature set to 0 (no location data)")
+    
+    # Domain Feature 2: Days to departure and bucketing
+    print("Adding days-to-departure feature...")
+    if 'outboundDate' in df.columns:
+        # Convert outbound date from timestamp to date
+        df['outbound_dt'] = pd.to_datetime(df['outboundDate'], unit='ms', errors='coerce')
+        # Calculate days to departure
+        df['days_to_departure'] = (df['outbound_dt'] - df['timestamp_dt']).dt.days
+        
+        # Bucket days to departure (0-7, 8-21, >21)
+        df['departure_bucket'] = pd.cut(
+            df['days_to_departure'],
+            bins=[-float('inf'), 7, 21, float('inf')],
+            labels=[0, 1, 2]  # 0-7 days, 8-21 days, >21 days
+        ).astype(int)
+        
+        print(f"✅ Days to departure: mean={df['days_to_departure'].mean():.1f}")
+    else:
+        # Fallback to advance purchase if outboundDate not available
+        df['days_to_departure'] = df['advancePurchase']
+        df['departure_bucket'] = pd.cut(
+            df['days_to_departure'],
+            bins=[-float('inf'), 7, 21, float('inf')],
+            labels=[0, 1, 2]
+        ).astype(int)
+        print("⚠️ Using advancePurchase as days_to_departure proxy")
+    
+    # Domain Feature 3: YQ banned airports flag
+    print("Adding YQ banned airports flag...")
+    banned_airports = get_yq_banned_airports()
+    df['is_origin_yq_banned'] = df['originCityCode'].isin(banned_airports).astype(int)
+    df['is_dest_yq_banned'] = df['destinationCityCode'].isin(banned_airports).astype(int)
+    df['is_route_yq_banned'] = ((df['is_origin_yq_banned'] == 1) | 
+                                (df['is_dest_yq_banned'] == 1)).astype(int)
+    
+    banned_origin_count = df['is_origin_yq_banned'].sum()
+    banned_dest_count = df['is_dest_yq_banned'].sum()
+    banned_route_count = df['is_route_yq_banned'].sum()
+    print(f"✅ YQ banned: {banned_origin_count} origins, {banned_dest_count} destinations, {banned_route_count} routes")
+    
     df['total_duration'] = df['inboundDuration'] + df['outboundDuration']
     df['is_round_trip'] = (df['returnDate'] > 0).astype(int)
     df['same_carrier'] = (df['inboundOperatingCarrier'] == df['outboundOperatingCarrier']).astype(int)
     
-    df['price_tier'] = pd.cut(df['totalAmount'], 
-                             bins=[0, 500, 2000, float('inf')], 
+    df['price_tier'] = pd.cut(df['base_fare'], 
+                             bins=[0, 400, 1500, float('inf')], 
                              labels=[0, 1, 2]).astype(int)
     df['early_booking'] = (df['advancePurchase'] >= 30).astype(int)
     
@@ -103,18 +247,142 @@ def preprocess_data(df):
         le = LabelEncoder()
         df[col + '_encoded'] = le.fit_transform(df[col].astype(str))
     
-    feature_cols = [
-        'totalAmount', 'advancePurchase', 'lengthOfStay',
-        'inboundDuration', 'outboundDuration', 'total_duration',
+    # Target encoding for wide keys
+    print("Creating target-encoded features...")
+    df['route_te'] = target_encode_features(
+        df, 'yq', ['originCityCode', 'destinationCityCode']
+    )
+    df['carrier_route_te'] = target_encode_features(
+        df, 'yq', ['validatingCarrier', 'originCityCode', 'destinationCityCode']
+    )
+    
+    # Identify categorical features for LightGBM
+    categorical_features = [
+        'originCityCode_encoded', 'destinationCityCode_encoded', 'currencyCode_encoded',
         'validatingCarrier_encoded', 'inboundOperatingCarrier_encoded', 
-        'outboundOperatingCarrier_encoded', 'price_tier', 'early_booking'
+        'outboundOperatingCarrier_encoded', 'price_tier', 'departure_bucket',
+        'is_origin_yq_banned', 'is_dest_yq_banned', 'is_route_yq_banned'
+    ]
+    
+    feature_cols = [
+        'base_fare', 'advancePurchase', 'lengthOfStay', 'days_to_departure',
+        'inboundDuration', 'outboundDuration', 'total_duration', 'distance_km',
+        'validatingCarrier_encoded', 'inboundOperatingCarrier_encoded', 
+        'outboundOperatingCarrier_encoded', 'price_tier', 'early_booking',
+        'departure_bucket', 'is_origin_yq_banned', 'is_dest_yq_banned', 'is_route_yq_banned',
+        'route_te', 'carrier_route_te', 'hour', 'day_of_week', 'month'
     ]
     
     X = df[feature_cols].copy()
     targets = {'yq': df['yq'].values, 'yr': df['yr'].values}
     
+    # Cache the preprocessed data
+    result = (X, targets, feature_cols, categorical_features)
+    if use_cache:
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(result, f)
+                print("💾 Saved preprocessed data to cache")
+        except Exception as e:
+            print(f"⚠️ Could not save cache: {e}")
+    
     print(f"✅ Feature matrix: {X.shape}")
-    return X, targets, feature_cols
+    print(f"✅ Categorical features: {len(categorical_features)}")
+    print(f"✅ Domain features added: distance_km, days_to_departure, departure_bucket, YQ_banned flags")
+    return result
+
+def target_encode_features(df, target_col, key_cols, n_splits=5, random_state=42):
+    """
+    Perform 5-fold out-of-fold target encoding for specified key columns.
+    
+    Parameters
+    ----------
+    df : DataFrame
+        Input dataframe
+    target_col : str
+        Name of target column to encode against
+    key_cols : list
+        List of column names to group by for encoding
+    n_splits : int
+        Number of folds for cross-validation
+    random_state : int
+        Random state for reproducibility
+        
+    Returns
+    -------
+    encoded_values : Series
+        Target-encoded values aligned with input dataframe
+    """
+    encoded_values = np.zeros(len(df))
+    kfold = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    
+    # Create grouping key
+    group_key = df[key_cols].apply(lambda x: '_'.join(x.astype(str)), axis=1)
+    
+    for train_idx, val_idx in kfold.split(df):
+        # Calculate means on training fold
+        train_df = df.iloc[train_idx]
+        train_group_key = group_key.iloc[train_idx]
+        
+        group_means = train_df.groupby(train_group_key)[target_col].mean()
+        global_mean = train_df[target_col].mean()
+        
+        # Apply to validation fold
+        val_group_key = group_key.iloc[val_idx]
+        encoded_values[val_idx] = val_group_key.map(group_means).fillna(global_mean)
+    
+    return pd.Series(encoded_values, index=df.index)
+
+def create_validation_split(df, test_size=0.2, method='carrier_route', random_state=42):
+    """
+    Create better validation split based on carrier-route combinations or date blocks.
+    
+    Parameters
+    ----------
+    df : DataFrame
+        Input dataframe
+    test_size : float
+        Proportion of data for test set
+    method : str
+        Split method: 'carrier_route' or 'date'
+    random_state : int
+        Random state for reproducibility
+        
+    Returns
+    -------
+    train_idx, test_idx : arrays
+        Indices for train and test sets
+    """
+    np.random.seed(random_state)
+    
+    if method == 'carrier_route':
+        # Group by (validatingCarrier, originCityCode, destinationCityCode)
+        group_key = df[['validatingCarrier', 'originCityCode', 'destinationCityCode']].apply(
+            lambda x: '_'.join(x.astype(str)), axis=1
+        )
+        unique_groups = group_key.unique()
+        
+        # Randomly select groups for test set
+        n_test_groups = max(1, int(len(unique_groups) * test_size))
+        test_groups = np.random.choice(unique_groups, size=n_test_groups, replace=False)
+        
+        test_mask = group_key.isin(test_groups)
+        
+    elif method == 'date':
+        # Sort by timestamp and split by date blocks
+        df_sorted = df.sort_values('timestamp')
+        split_idx = int(len(df_sorted) * (1 - test_size))
+        
+        test_mask = pd.Series(False, index=df.index)
+        test_mask.loc[df_sorted.index[split_idx:]] = True
+        
+    else:
+        raise ValueError("Method must be 'carrier_route' or 'date'")
+    
+    train_idx = df.index[~test_mask].values
+    test_idx = df.index[test_mask].values
+    
+    return train_idx, test_idx
 
 def calculate_hit_rate(y_true, y_pred, tolerance=2.0):
     """Calculate hit rate - predictions within tolerance."""
@@ -132,14 +400,23 @@ def calculate_hit_rate(y_true, y_pred, tolerance=2.0):
         'nonzero_hit_rate': nonzero_hits.mean() if nonzero_mask.sum() > 0 else 0
     }
 
-def train_model(X, y, params, num_boost_round, early_stopping_rounds, desc):
-    """Train a LightGBM model."""
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+def train_model(X, y, params, num_boost_round, early_stopping_rounds, desc, df_full, categorical_features):
+    """Train a LightGBM model with better validation split and categorical features."""
+    # Use better validation split
+    train_idx, test_idx = create_validation_split(df_full, test_size=0.2, method='carrier_route')
     
-    train_data = lgb.Dataset(X_train, label=y_train)
-    valid_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
+    X_train = X.iloc[train_idx]
+    X_test = X.iloc[test_idx]
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+    
+    print(f"Train set: {len(X_train)} samples, Test set: {len(X_test)} samples")
+    
+    # Map categorical feature names to indices
+    categorical_indices = [X.columns.get_loc(col) for col in categorical_features if col in X.columns]
+    
+    train_data = lgb.Dataset(X_train, label=y_train, categorical_feature=categorical_indices)
+    valid_data = lgb.Dataset(X_test, label=y_test, reference=train_data, categorical_feature=categorical_indices)
     
     with tqdm(total=num_boost_round, desc=desc) as pbar:
         model = lgb.train(
@@ -163,7 +440,7 @@ def train_model(X, y, params, num_boost_round, early_stopping_rounds, desc):
     
     return model, results
 
-def optimize_hyperparameters(X, y, n_trials=15):
+def optimize_hyperparameters(X, y, df_full, categorical_features, n_trials=15):
     """Use Optuna to tune LightGBM hyperparameters to maximize hit rate (±10%)."""
     import optuna  # type: ignore  # Imported lazily to avoid linter resolution issues
 
@@ -191,7 +468,9 @@ def optimize_hyperparameters(X, y, n_trials=15):
             param_grid,
             num_boost_round=300,
             early_stopping_rounds=30,
-            desc=f"Optuna trial {trial.number}"
+            desc=f"Optuna trial {trial.number}",
+            df_full=df_full,
+            categorical_features=categorical_features
         )
 
         # Optuna minimizes the objective; use (1 - hit_rate) so that higher hit_rate is better
@@ -303,19 +582,19 @@ def report_and_save_results(model, results, feature_cols, df_all):
         f.write(f"Features: {len(feature_cols)}\n")
     print("✅ Artifacts saved: yq_final_model.txt, feature_names.csv, model_results.txt")
 
-def main(tune_hyperparameters: bool = False):
+def main(tune_hyperparameters: bool = False, use_cache: bool = True):
     """Main pipeline execution."""
     print("🚀 YQ TAX PREDICTION PIPELINE")
     print("=" * 50)
     
     df = load_and_combine_data()
-    X, targets, feature_cols = preprocess_data(df)
+    X, targets, feature_cols, categorical_features = preprocess_data(df, use_cache=use_cache)
     # Do not delete df yet – needed for airline grouping metrics
     
     best_params = {}
     if tune_hyperparameters:
         # Hyperparameter tuning
-        best_params = optimize_hyperparameters(X, targets['yq'], n_trials=50)
+        best_params = optimize_hyperparameters(X, targets['yq'], df, categorical_features, n_trials=50)
     else:
         print("\nSkipping hyperparameter tuning. Using default parameters.")
         best_params = {
@@ -339,7 +618,9 @@ def main(tune_hyperparameters: bool = False):
         best_params,
         num_boost_round=300,
         early_stopping_rounds=30,
-        desc="Final training"
+        desc="Final training",
+        df_full=df,
+        categorical_features=categorical_features
     )
     
     # Before reporting, update the pct_hit_rate in final_results
@@ -358,8 +639,9 @@ def main(tune_hyperparameters: bool = False):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="YR Tax Prediction Pipeline")
+    parser = argparse.ArgumentParser(description="YQ Tax Prediction Pipeline")
     parser.add_argument("--tune", action="store_true", help="Enable hyperparameter tuning")
+    parser.add_argument("--no-cache", action="store_true", help="Disable preprocessing cache")
     args = parser.parse_args()
 
-    main(tune_hyperparameters=args.tune) 
+    main(tune_hyperparameters=args.tune, use_cache=not args.no_cache) 
