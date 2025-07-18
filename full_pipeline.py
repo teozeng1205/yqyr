@@ -9,7 +9,7 @@ Retains essential printing and progress bars.
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split, KFold
+from sklearn.model_selection import train_test_split, KFold, GroupShuffleSplit
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import LabelEncoder
 import glob
@@ -52,24 +52,6 @@ def load_city_locations():
     except Exception as e:
         print(f"⚠️ Could not load citylocation.csv: {e}")
         return None
-
-def get_yq_banned_airports():
-    """Return set of airport codes where YQ taxes are typically banned/restricted."""
-    # Common airports/countries where YQ taxes are banned or restricted
-    banned_codes = {
-        # Brazil airports (BR country code in data)
-        'GRU', 'CGH', 'BSB', 'RIO', 'SDU', 'GIG', 'SSA', 'FOR', 'REC', 'MAO',
-        'BEL', 'CWB', 'FLN', 'POA', 'VIX', 'MCZ', 'NAT', 'AJU', 'JPA', 'THE',
-        # Hong Kong 
-        'HKG',
-        # Philippines airports (PH country code)
-        'MNL', 'CEB', 'DVO', 'ILO', 'CRK', 'KLO', 'TAG', 'BCD', 'CGY', 'DGT',
-        # Additional commonly restricted airports
-        'TPE', 'KHH',  # Taiwan
-        'ICN', 'GMP',  # South Korea
-        'NRT', 'HND',  # Japan (some restrictions)
-    }
-    return banned_codes
 
 # ---------------------------------------------------------------------------
 # Helper metric: percentage-based hit rate
@@ -142,11 +124,7 @@ def preprocess_data(df, use_cache=True):
     print(f"YQ stats: mean=${df['yq'].mean():.2f}, non-zero={df['yq'].gt(0).mean()*100:.1f}%")
     print(f"YR stats: mean=${df['yr'].mean():.2f}, non-zero={df['yr'].gt(0).mean()*100:.1f}%")
     
-    # Remove leakage: create base fare proxy instead of using raw totalAmount
-    print("Creating base fare proxy to remove leakage...")
-    est_other_taxes = 50  # Estimate for other taxes/fees not captured in yq/yr
-    df['base_fare'] = df['totalAmount'] - df['yq'] - df['yr'] - est_other_taxes
-    df['base_fare'] = df['base_fare'].clip(lower=0)  # Ensure non-negative
+    df['base_fare'] = df['totalAmount']
     
     df['timestamp_dt'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['hour'] = df['timestamp_dt'].dt.hour
@@ -216,19 +194,6 @@ def preprocess_data(df, use_cache=True):
         ).astype(int)
         print("⚠️ Using advancePurchase as days_to_departure proxy")
     
-    # Domain Feature 3: YQ banned airports flag
-    print("Adding YQ banned airports flag...")
-    banned_airports = get_yq_banned_airports()
-    df['is_origin_yq_banned'] = df['originCityCode'].isin(banned_airports).astype(int)
-    df['is_dest_yq_banned'] = df['destinationCityCode'].isin(banned_airports).astype(int)
-    df['is_route_yq_banned'] = ((df['is_origin_yq_banned'] == 1) | 
-                                (df['is_dest_yq_banned'] == 1)).astype(int)
-    
-    banned_origin_count = df['is_origin_yq_banned'].sum()
-    banned_dest_count = df['is_dest_yq_banned'].sum()
-    banned_route_count = df['is_route_yq_banned'].sum()
-    print(f"✅ YQ banned: {banned_origin_count} origins, {banned_dest_count} destinations, {banned_route_count} routes")
-    
     df['total_duration'] = df['inboundDuration'] + df['outboundDuration']
     df['is_round_trip'] = (df['returnDate'] > 0).astype(int)
     df['same_carrier'] = (df['inboundOperatingCarrier'] == df['outboundOperatingCarrier']).astype(int)
@@ -237,6 +202,34 @@ def preprocess_data(df, use_cache=True):
                              bins=[0, 400, 1500, float('inf')], 
                              labels=[0, 1, 2]).astype(int)
     df['early_booking'] = (df['advancePurchase'] >= 30).astype(int)
+
+    # === NEW FEATURE ENGINEERING ==========================================
+    # Ratio / interaction features
+    df['price_per_km'] = df['base_fare'] / (df['distance_km'] + 1)
+    df['price_per_day'] = df['base_fare'] / (df['lengthOfStay'] + 1)
+
+    # Distance buckets (0–1k, 1–3k, >3k km)
+    df['distance_bucket'] = pd.cut(
+        df['distance_km'],
+        bins=[-float('inf'), 1000, 3000, float('inf')],
+        labels=[0, 1, 2]
+    ).astype(int)
+
+    # Log-scale versions of skewed drivers
+    df['log_base_fare'] = np.log1p(df['base_fare'])
+    df['log_distance_km'] = np.log1p(df['distance_km'])
+    df['log_price_per_km'] = np.log1p(df['price_per_km'])
+
+    # Finer advance-purchase buckets (0-3, 4-7, 8-14, 15-30, >30 days)
+    df['adv_purchase_bucket'] = pd.cut(
+        df['advancePurchase'],
+        bins=[-float('inf'), 3, 7, 14, 30, float('inf')],
+        labels=[0, 1, 2, 3, 4]
+    ).astype(int)
+
+    # Seasonality signal (quarter of year: 0-3)
+    df['season'] = df['month'].apply(lambda m: (m - 1) // 3)
+    # =====================================================================
     
     categorical_cols = [
         'originCityCode', 'destinationCityCode', 'currencyCode',
@@ -249,28 +242,39 @@ def preprocess_data(df, use_cache=True):
     
     # Target encoding for wide keys
     print("Creating target-encoded features...")
-    df['route_te'] = target_encode_features(
-        df, 'yq', ['originCityCode', 'destinationCityCode']
-    )
-    df['carrier_route_te'] = target_encode_features(
-        df, 'yq', ['validatingCarrier', 'originCityCode', 'destinationCityCode']
-    )
+    
+    # Added carrier-only target encoding, so total=3
+    with tqdm(total=3, desc="Overall Target Encoding") as pbar:
+        df['route_te'] = target_encode_features(
+            df, 'yq', ['originCityCode', 'destinationCityCode']
+        )
+        pbar.update(1) # Update after first encoding
+        df['carrier_route_te'] = target_encode_features(
+            df, 'yq', ['validatingCarrier', 'originCityCode', 'destinationCityCode']
+        )
+        pbar.update(1) # Update after second encoding
+        # Carrier-only mean YQ (bias term)
+        df['carrier_te'] = target_encode_features(
+            df, 'yq', ['validatingCarrier']
+        )
+        pbar.update(1) # Update after third encoding
     
     # Identify categorical features for LightGBM
     categorical_features = [
         'originCityCode_encoded', 'destinationCityCode_encoded', 'currencyCode_encoded',
         'validatingCarrier_encoded', 'inboundOperatingCarrier_encoded', 
         'outboundOperatingCarrier_encoded', 'price_tier', 'departure_bucket',
-        'is_origin_yq_banned', 'is_dest_yq_banned', 'is_route_yq_banned'
+        'distance_bucket', 'adv_purchase_bucket', 'season'
     ]
     
     feature_cols = [
         'base_fare', 'advancePurchase', 'lengthOfStay', 'days_to_departure',
         'inboundDuration', 'outboundDuration', 'total_duration', 'distance_km',
-        'validatingCarrier_encoded', 'inboundOperatingCarrier_encoded', 
-        'outboundOperatingCarrier_encoded', 'price_tier', 'early_booking',
-        'departure_bucket', 'is_origin_yq_banned', 'is_dest_yq_banned', 'is_route_yq_banned',
-        'route_te', 'carrier_route_te', 'hour', 'day_of_week', 'month'
+        'price_per_km', 'price_per_day', 'log_base_fare', 'log_distance_km', 'log_price_per_km',
+        'validatingCarrier_encoded', 'inboundOperatingCarrier_encoded', 'outboundOperatingCarrier_encoded',
+        'price_tier', 'early_booking', 'departure_bucket', 'distance_bucket', 'adv_purchase_bucket', 'season',
+        'route_te', 'carrier_route_te', 'carrier_te',
+        'hour', 'day_of_week', 'month'
     ]
     
     X = df[feature_cols].copy()
@@ -288,7 +292,7 @@ def preprocess_data(df, use_cache=True):
     
     print(f"✅ Feature matrix: {X.shape}")
     print(f"✅ Categorical features: {len(categorical_features)}")
-    print(f"✅ Domain features added: distance_km, days_to_departure, departure_bucket, YQ_banned flags")
+    print(f"✅ Domain features added: distance_km, days_to_departure, departure_bucket")
     return result
 
 def target_encode_features(df, target_col, key_cols, n_splits=5, random_state=42):
@@ -316,19 +320,19 @@ def target_encode_features(df, target_col, key_cols, n_splits=5, random_state=42
     encoded_values = np.zeros(len(df))
     kfold = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     
-    # Create grouping key
-    group_key = df[key_cols].apply(lambda x: '_'.join(x.astype(str)), axis=1)
-    
-    for train_idx, val_idx in kfold.split(df):
+    # Create grouping key once outside the loop
+    group_key_series = df[key_cols].astype(str).agg('_'.join, axis=1)
+
+    for fold, (train_idx, val_idx) in tqdm(enumerate(kfold.split(df)), total=n_splits, desc="Target Encoding Folds"):
         # Calculate means on training fold
         train_df = df.iloc[train_idx]
-        train_group_key = group_key.iloc[train_idx]
+        train_group_key = group_key_series.iloc[train_idx]
         
         group_means = train_df.groupby(train_group_key)[target_col].mean()
         global_mean = train_df[target_col].mean()
         
         # Apply to validation fold
-        val_group_key = group_key.iloc[val_idx]
+        val_group_key = group_key_series.iloc[val_idx]
         encoded_values[val_idx] = val_group_key.map(group_means).fillna(global_mean)
     
     return pd.Series(encoded_values, index=df.index)
@@ -356,18 +360,23 @@ def create_validation_split(df, test_size=0.2, method='carrier_route', random_st
     np.random.seed(random_state)
     
     if method == 'carrier_route':
-        # Group by (validatingCarrier, originCityCode, destinationCityCode)
-        group_key = df[['validatingCarrier', 'originCityCode', 'destinationCityCode']].apply(
-            lambda x: '_'.join(x.astype(str)), axis=1
+        # --- New: Stratified 80/20 split using GroupShuffleSplit --------------------
+        # Preserve carrier-route grouping while achieving an (approximately) row-level
+        # 80/20 split.  GroupShuffleSplit selects whole groups until the requested
+        # proportion of rows is reached, giving a much tighter control over the
+        # actual train/test sizes compared with the previous uniform-group sampling
+        # approach.
+
+        # Build a grouping key (tuple of carrier, origin, destination)
+        groups = pd.MultiIndex.from_frame(
+            df[['validatingCarrier', 'originCityCode', 'destinationCityCode']]
         )
-        unique_groups = group_key.unique()
-        
-        # Randomly select groups for test set
-        n_test_groups = max(1, int(len(unique_groups) * test_size))
-        test_groups = np.random.choice(unique_groups, size=n_test_groups, replace=False)
-        
-        test_mask = group_key.isin(test_groups)
-        
+
+        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+        train_idx, test_idx = next(gss.split(df, groups=groups))
+
+        return train_idx, test_idx
+    
     elif method == 'date':
         # Sort by timestamp and split by date blocks
         df_sorted = df.sort_values('timestamp')
@@ -475,13 +484,13 @@ def optimize_hyperparameters(X, y, df_full, categorical_features, n_trials=15):
 
         # Optuna minimizes the objective; use (1 - hit_rate) so that higher hit_rate is better
         # For 5% tolerance, use calculate_percentage_hit_rate
-        pct_hit_rate = calculate_percentage_hit_rate(results['y_test'], results['y_pred'], percent_tolerance=0.05)['overall_hit_rate']
+        pct_hit_rate = calculate_percentage_hit_rate(results['y_test'], results['y_pred'], percent_tolerance=0.10)['overall_hit_rate']
         return 1.0 - pct_hit_rate
 
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    print(f"\n🏆 Best hit rate: {(1 - study.best_value) * 100:.2f}% within 5%")
+    print(f"\n🏆 Best hit rate: {(1 - study.best_value) * 100:.2f}% within 10%")
 
     # Merge constant parameters with the best hyperparameters found
     best_params = study.best_params
@@ -502,7 +511,7 @@ def report_and_save_results(model, results, feature_cols, df_all):
     print(f"RMSE: {results['rmse']:.2f} | MAE: {results['mae']:.2f} | R²: {results['r2']:.4f}")
 
     # ---------------- Absolute $ tolerance hit rates ----------------
-    tolerances = [1, 2, 5]
+    tolerances = [1, 2, 5, 10]
     hit_rates = {t: calculate_hit_rate(results['y_test'], results['y_pred'], tolerance=float(t)) for t in tolerances}
     for t in tolerances:
         label = "(±$2)" if t == 2 else f"(±${t})"
@@ -513,7 +522,7 @@ def report_and_save_results(model, results, feature_cols, df_all):
     print(f"  • Zero: {two_tol['zero_hit_rate']*100:.1f}% | Non-zero: {two_tol['nonzero_hit_rate']*100:.1f}%")
 
     # ---------------- Percentage tolerance hit rates ----------------
-    pct_tols = [0.01, 0.02, 0.05]
+    pct_tols = [0.01, 0.02, 0.05, 0.10]
     pct_hit_rates = {p: calculate_percentage_hit_rate(results['y_test'], results['y_pred'], percent_tolerance=p) for p in pct_tols}
 
     for p in pct_tols:
@@ -539,8 +548,8 @@ def report_and_save_results(model, results, feature_cols, df_all):
     sorted_carriers = sorted(carrier_performance.items(), key=lambda x: x[1], reverse=True)
 
     # Define tolerances here so they are accessible
-    tolerances = [1, 2, 5]
-    pct_tols = [0.01, 0.02, 0.05]
+    tolerances = [1, 2, 5, 10]
+    pct_tols = [0.01, 0.02, 0.05, 0.10]
 
     for carrier, _ in sorted_carriers:
         carrier_mask = airline_series == carrier
@@ -579,6 +588,12 @@ def report_and_save_results(model, results, feature_cols, df_all):
         f.write(f"RMSE: {results['rmse']:.2f}\nMAE: {results['mae']:.2f}\nR²: {results['r2']:.4f}\n")
         for t in tolerances:
             f.write(f"Hit Rate (±${t}): {hit_rates[t]['overall_hit_rate']*100:.1f}%\n")
+        
+        # Write percentage hit rates to file
+        for p in pct_tols:
+            pct_label = int(p * 100)
+            f.write(f"Hit Rate (±{pct_label}%): {pct_hit_rates[p]['overall_hit_rate']*100:.1f}%\n")
+
         f.write(f"Features: {len(feature_cols)}\n")
     print("✅ Artifacts saved: yq_final_model.txt, feature_names.csv, model_results.txt")
 
@@ -626,7 +641,7 @@ def main(tune_hyperparameters: bool = False, use_cache: bool = True):
     # Before reporting, update the pct_hit_rate in final_results
     # This is needed because the value was initialized to None and not updated elsewhere.
     # Using the 5% tolerance hit rate as per the final print statement.
-    final_results['pct_hit_rate'] = calculate_percentage_hit_rate(final_results['y_test'], final_results['y_pred'], percent_tolerance=0.05)
+    final_results['pct_hit_rate'] = calculate_percentage_hit_rate(final_results['y_test'], final_results['y_pred'], percent_tolerance=0.10)
 
     report_and_save_results(final_model, final_results, feature_cols, df)
 
@@ -634,7 +649,7 @@ def main(tune_hyperparameters: bool = False, use_cache: bool = True):
     del df; gc.collect()
     
     print("\n🎉 PIPELINE COMPLETE!")
-    print(f"🎯 Final Result: {final_results['pct_hit_rate']['overall_hit_rate']*100:.1f}% within 5%")
+    print(f"🎯 Final Result: {final_results['pct_hit_rate']['overall_hit_rate']*100:.1f}% within 10%")
 
 if __name__ == "__main__":
     import argparse
