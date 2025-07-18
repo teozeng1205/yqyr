@@ -1,8 +1,9 @@
-YR Tax Prediction Model Results
+YQ Tax Prediction Model Results
 ========================================
-
-RMSE: 6.10
-MAE: 1.19
-R²: 0.9953
-Hit Rate (±$2): 94.6%
+RMSE: 24.66
+MAE: 16.87
+R²: 0.9691
+Hit Rate (±$1): 7.1%
+Hit Rate (±$2): 14.0%
+Hit Rate (±$5): 29.1%
 Features: 11
