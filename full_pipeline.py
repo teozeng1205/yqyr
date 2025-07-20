@@ -159,6 +159,35 @@ def _add_engineered_features(df):
     df['season'] = df['month'].apply(lambda m: (m - 1) // 3)
     return df
 
+def _add_carrier_agg_features(df):
+    """Adds carrier-based aggregate features using out-of-fold encoding."""
+    aggregations = {
+        'base_fare': ['mean', 'std'],
+        'distance_km': ['mean', 'std'],
+        'lengthOfStay': ['mean', 'std'],
+        'total_duration': ['mean']
+    }
+    
+    new_features = []
+    # Use a generic out-of-fold encoding function for these aggregates
+    with tqdm(total=sum(len(v) for v in aggregations.values()), desc="Carrier Aggregates") as pbar:
+        for feature, agg_funcs in aggregations.items():
+            for agg_func in agg_funcs:
+                new_col_name = f'carrier_{agg_func}_{feature}'
+                # Use the modified target_encode_features for generic aggregation
+                df[new_col_name] = target_encode_features(df, feature, ['validatingCarrier'], agg_method=agg_func)
+                new_features.append(new_col_name)
+                
+                # Add interaction feature: deviation from the mean
+                if agg_func == 'mean':
+                    deviation_col_name = f'{feature}_vs_carrier_mean'
+                    df[deviation_col_name] = df[feature] - df[new_col_name]
+                    new_features.append(deviation_col_name)
+                
+                pbar.update(1)
+
+    return df, new_features
+
 def _encode_categorical_features(df):
     """Encodes categorical columns using LabelEncoder and target encoding."""
     # Label Encoding
@@ -203,6 +232,7 @@ def preprocess_data(df, use_cache=True):
     df = _add_time_features(df)
     df = _add_domain_features(df)
     df = _add_engineered_features(df)
+    df, carrier_agg_features = _add_carrier_agg_features(df)  # Add carrier-specific features
     df = _encode_categorical_features(df)
     
     # --- Final Feature Selection ---
@@ -216,12 +246,16 @@ def preprocess_data(df, use_cache=True):
     feature_cols = [
         'base_fare', 'advancePurchase', 'lengthOfStay', 'days_to_departure',
         'inboundDuration', 'outboundDuration', 'total_duration', 'distance_km',
+        'is_round_trip', 'same_carrier',  # Added features
         'price_per_km', 'price_per_day', 'log_base_fare', 'log_distance_km', 'log_price_per_km',
         'validatingCarrier_encoded', 'inboundOperatingCarrier_encoded', 'outboundOperatingCarrier_encoded',
         'price_tier', 'early_booking', 'departure_bucket', 'distance_bucket', 'adv_purchase_bucket', 'season',
         'route_te', 'carrier_route_te', 'carrier_te',
         'hour', 'day_of_week', 'month'
     ]
+    
+    # Add newly engineered carrier features to the list
+    feature_cols.extend(carrier_agg_features)
     
     X = df[feature_cols].copy()
     targets = {'yq': df['yq'].values, 'yr': df['yr'].values}
@@ -238,7 +272,7 @@ def preprocess_data(df, use_cache=True):
     print(f"✅ Feature matrix: {X.shape}")
     return result
 
-def target_encode_features(df, target_col, key_cols, n_splits=5, random_state=42):
+def target_encode_features(df, target_col, key_cols, n_splits=5, random_state=42, agg_method='mean'):
     """
     Perform 5-fold out-of-fold target encoding for specified key columns.
     
@@ -254,6 +288,8 @@ def target_encode_features(df, target_col, key_cols, n_splits=5, random_state=42
         Number of folds for cross-validation
     random_state : int
         Random state for reproducibility
+    agg_method : str, default 'mean'
+        The aggregation method to use ('mean', 'std', 'min', 'max', etc.)
         
     Returns
     -------
@@ -266,26 +302,25 @@ def target_encode_features(df, target_col, key_cols, n_splits=5, random_state=42
     # Create grouping key once outside the loop
     group_key_series = df[key_cols].astype(str).agg('_'.join, axis=1)
 
-    for fold, (train_idx, val_idx) in tqdm(enumerate(kfold.split(df)), total=n_splits, desc="Target Encoding Folds"):
-        # Calculate means on training fold
+    desc = f"Encoding {target_col} by {','.join(key_cols)} ({agg_method})"
+    for fold, (train_idx, val_idx) in tqdm(enumerate(kfold.split(df)), total=n_splits, desc=desc):
+        # Calculate aggregate on training fold
         train_df = df.iloc[train_idx]
         train_group_key = group_key_series.iloc[train_idx]
         
-        group_means = train_df.groupby(train_group_key)[target_col].mean()
-        global_mean = train_df[target_col].mean()
+        group_aggs = train_df.groupby(train_group_key)[target_col].agg(agg_method)
+        global_agg = train_df[target_col].agg(agg_method)
         
         # Apply to validation fold
         val_group_key = group_key_series.iloc[val_idx]
-        encoded_values[val_idx] = val_group_key.map(group_means).fillna(global_mean)
+        encoded_values[val_idx] = val_group_key.map(group_aggs).fillna(global_agg)
     
     return pd.Series(encoded_values, index=df.index)
 
-def create_validation_split(df, test_size=0.2, method='carrier_route', random_state=42):
+def create_validation_split(df, test_size=0.2, random_state=42):
     """
     Create validation split using one of three methods:
-    1. 'carrier_route'  – group-wise split on (carrier, origin, destination)
-    2. 'date'           – chronological split based on timestamp
-    3. 'stratified'     – row-level split stratified on (carrier, origin, destination)
+    This function performs a row-level split stratified on (carrier, origin, destination).
     
     Parameters
     ----------
@@ -293,8 +328,6 @@ def create_validation_split(df, test_size=0.2, method='carrier_route', random_st
         Input dataframe
     test_size : float
         Proportion of data for test set
-    method : str
-        Split method: 'carrier_route', 'date', or 'stratified'
     random_state : int
         Random state for reproducibility
         
@@ -305,56 +338,24 @@ def create_validation_split(df, test_size=0.2, method='carrier_route', random_st
     """
     np.random.seed(random_state)
     
-    if method == 'carrier_route':
-        # Vectorized factorization of the (validatingCarrier, originCityCode, destinationCityCode) combination
-        # This avoids the extremely slow row-wise apply used previously and scales well to tens of millions of rows.
-        combo_index = pd.MultiIndex.from_frame(
-            df[['validatingCarrier', 'originCityCode', 'destinationCityCode']]
+    # Stratified 80/20 split on (carrier, origin, destination) combination.
+    stratify_key = df[['validatingCarrier', 'originCityCode', 'destinationCityCode']]
+    stratify_key = stratify_key.astype(str).agg('_'.join, axis=1)
+
+    try:
+        train_idx, test_idx = train_test_split(
+            df.index.values,
+            test_size=test_size,
+            stratify=stratify_key,
+            random_state=random_state
         )
-        group_codes, uniques = pd.factorize(combo_index)
-        n_unique = len(uniques)
-
-        # Randomly select groups for test set
-        n_test_groups = max(1, int(n_unique * test_size))
-        test_group_codes = np.random.choice(n_unique, size=n_test_groups, replace=False)
-
-        test_mask = np.isin(group_codes, test_group_codes)
-        
-    elif method == 'stratified':
-        # Stratified 80/20 split on (carrier, origin, destination) combination.
-        stratify_key = df[['validatingCarrier', 'originCityCode', 'destinationCityCode']]
-        stratify_key = stratify_key.astype(str).agg('_'.join, axis=1)
-
-        try:
-            train_idx, test_idx = train_test_split(
-                df.index.values,
-                test_size=test_size,
-                stratify=stratify_key,
-                random_state=random_state
-            )
-        except ValueError:
-            # Fallback if some classes are too small for stratification
-            train_idx, test_idx = train_test_split(
-                df.index.values,
-                test_size=test_size,
-                random_state=random_state
-            )
-
-        return train_idx, test_idx
-
-    elif method == 'date':
-        # Sort by timestamp and split by date blocks
-        df_sorted = df.sort_values('timestamp')
-        split_idx = int(len(df_sorted) * (1 - test_size))
-        
-        test_mask = pd.Series(False, index=df.index)
-        test_mask.loc[df_sorted.index[split_idx:]] = True
-        
-    else:
-        raise ValueError("Method must be 'carrier_route', 'date', or 'stratified'")
-    
-    train_idx = df.index[~test_mask].values
-    test_idx = df.index[test_mask].values
+    except ValueError:
+        # Fallback if some classes are too small for stratification
+        train_idx, test_idx = train_test_split(
+            df.index.values,
+            test_size=test_size,
+            random_state=random_state
+        )
 
     return train_idx, test_idx
 
@@ -377,7 +378,7 @@ def calculate_hit_rate(y_true, y_pred, tolerance=2.0):
 def train_model(X, y, params, num_boost_round, early_stopping_rounds, desc, df_full, categorical_features):
     """Train a LightGBM model with better validation split and categorical features."""
     # Use better validation split
-    train_idx, test_idx = create_validation_split(df_full, test_size=0.2, method='stratified')
+    train_idx, test_idx = create_validation_split(df_full, test_size=0.2)
     
     X_train = X.iloc[train_idx]
     X_test = X.iloc[test_idx]
@@ -465,13 +466,12 @@ def optimize_hyperparameters(X, y, df_full, categorical_features, n_trials=25):
 
         # Optuna minimizes the objective; use (1 - hit_rate) so that higher hit_rate is better
         # For 5% tolerance, use calculate_percentage_hit_rate
-        pct_hit_rate = calculate_percentage_hit_rate(results['y_test'], results['y_pred'], percent_tolerance=0.10)['overall_hit_rate']
         return results['rmse']
 
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
-    print(f"\n🏆 Best hit rate: {(1 - study.best_value) * 100:.2f}% within 10%")
+    print(f"\n🏆 Best RMSE: {study.best_value:.2f}")
 
     # Merge constant parameters with the best hyperparameters found
     best_params = study.best_params
@@ -591,7 +591,7 @@ def plot_analysis_for_carriers(y_test, y_pred, df_all, test_idx, carriers_to_plo
     plot_configs = [
         {'name': 'percentage_error', 'plot_func': sns.histplot, 'args': {'x': 'pct_error', 'bins': 50, 'kde': True}},
         {'name': 'absolute_error', 'plot_func': sns.histplot, 'args': {'x': 'abs_error', 'bins': 50, 'kde': True}},
-        {'name': 'pred_vs_true', 'plot_func': sns.scatterplot, 'args': {'x': 'y_test', 'y_pred': 'y_pred', 'alpha': 0.3, 's': 10}}
+        {'name': 'pred_vs_true', 'plot_func': sns.scatterplot, 'args': {'x': 'y_test', 'y': 'y_pred', 'alpha': 0.3, 's': 10}}
     ]
 
     for config in plot_configs:
