@@ -430,9 +430,9 @@ def optimize_hyperparameters(X, y, df_full, categorical_features, n_trials=25):
 
             # --- Tuned ranges ---
             # Larger range for tree size to allow for more complex models
-            'num_leaves': trial.suggest_int('num_leaves', 128, 1024, step=128),
+            'num_leaves': trial.suggest_int('num_leaves', 128, 2048, step=128),
             # Deeper trees to capture more complex relationships
-            'max_depth': trial.suggest_int('max_depth', 8, 20, step=2),
+            'max_depth': trial.suggest_int('max_depth', 12, 30, step=2),
 
             # Learning rate kept in a tighter, more realistic band for big data
             'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
@@ -515,16 +515,17 @@ def _report_carrier_performance(results, df_all):
         carrier_performance[carrier] = {
             'abs_hr_2': calculate_hit_rate(y_test_carrier, y_pred_carrier, tolerance=2.0)['overall_hit_rate'],
             'pct_hr_5': calculate_percentage_hit_rate(y_test_carrier, y_pred_carrier, percent_tolerance=0.05)['overall_hit_rate'],
+            'pct_hr_10': calculate_percentage_hit_rate(y_test_carrier, y_pred_carrier, percent_tolerance=0.10)['overall_hit_rate'],
             'rmse': np.sqrt(mean_squared_error(y_test_carrier, y_pred_carrier)),
             'count': len(y_test_carrier)
         }
         
     # Sort carriers by the primary metric (e.g., ±$2 hit rate)
-    sorted_carriers = sorted(carrier_performance.items(), key=lambda item: item[1]['abs_hr_2'], reverse=True)
+    sorted_carriers = sorted(carrier_performance.items(), key=lambda item: item[1]['pct_hr_10'], reverse=True)
 
     # Print results
     for carrier, perf in sorted_carriers:
-        print(f"Carrier: {carrier:<4} | Count: {perf['count']:<6} | RMSE: ${perf['rmse']:<5.2f} | HR(±$2): {perf['abs_hr_2']*100:<4.1f}% | HR(±5%): {perf['pct_hr_5']*100:<4.1f}%")
+        print(f"Carrier: {carrier:<4} | Count: {perf['count']:<6} | RMSE: ${perf['rmse']:<5.2f} | HR(±$2): {perf['abs_hr_2']*100:<4.1f}% | HR(±10%): {perf['pct_hr_10']*100:<4.1f}%")
 
 def report_and_save_results(model, results, feature_cols, df_all):
     """Print evaluation metrics, feature importance, and save artifacts."""
