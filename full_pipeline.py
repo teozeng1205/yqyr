@@ -429,23 +429,23 @@ def optimize_hyperparameters(X, y, df_full, categorical_features, n_trials=25):
             'random_state': 42,
 
             # --- Tuned ranges ---
-            # Larger but coarser range for tree size; step size chosen to limit evaluations
-            'num_leaves': trial.suggest_int('num_leaves', 64, 512, step=64),
-            # Explicit depth control to avoid overly deep trees that slow training
-            'max_depth': trial.suggest_int('max_depth', 6, 16, step=2),
+            # Larger range for tree size to allow for more complex models
+            'num_leaves': trial.suggest_int('num_leaves', 128, 1024, step=128),
+            # Deeper trees to capture more complex relationships
+            'max_depth': trial.suggest_int('max_depth', 8, 20, step=2),
 
             # Learning rate kept in a tighter, more realistic band for big data
-            'learning_rate': trial.suggest_float('learning_rate', 0.03, 0.15, log=True),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
 
-            # Column & row sampling (a.k.a. feature_fraction & bagging_fraction)
-            'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 1.0),
-            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 1.0),
+            # Column & row sampling (a.k.a. feature_fraction & bagging_fraction) - adjusted to use more features/data
+            'feature_fraction': trial.suggest_float('feature_fraction', 0.8, 1.0),
+            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.8, 1.0),
 
-            # Leaf-wise regularisation controls
-            'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 20, 100, step=5),
+            # Leaf-wise regularisation controls - allowing for more specific leaves
+            'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 10, 50, step=5),
 
             # Histogram binning – larger bins can improve accuracy but increase memory; tune sparingly
-            'max_bin': trial.suggest_int('max_bin', 255, 1023, step=128),
+            'max_bin': trial.suggest_int('max_bin', 511, 2047, step=256),
 
             # L1/L2 regularisation (narrower range speeds up search)
             'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 0.5),
